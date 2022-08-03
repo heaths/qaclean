@@ -20,7 +20,8 @@ var command = new RootCommand("Cognitive Service - Language sample application f
 
             return null;
         },
-        description: "Question Answering (formerly QnA Maker) endpoint. The default is the QUESTIONANSWERING_ENDPOINT environment variable.")
+        description: "Question Answering (formerly QnA Maker) endpoint. The default is the QUESTIONANSWERING_ENDPOINT environment variable."
+    )
     {
         IsRequired = true,
     },
@@ -32,18 +33,31 @@ var command = new RootCommand("Cognitive Service - Language sample application f
 
     new Option<Regex>(
         "--pattern",
-        getDefaultValue: () => new Regex("TestProject"))
+        getDefaultValue: () => new Regex("TestProject"),
+        description: "The .NET regular expression to match projects to be deleted."
+    )
     {
         IsRequired = true,
     },
 
     new Option<bool>(
         new[]{"-d", "--debug" },
-        "Enable debug logging."),
+        "Enable debug logging."
+    ),
 
     new Option<bool>(
         "--dry-run",
-        "Show what would happen but do not make any changes."),
+        "Show what would happen but do not make any changes."
+    ),
+
+    new Option<int>(
+        "--workers",
+        getDefaultValue: () => Environment.ProcessorCount,
+        description: "The maximum number of parallel deletions. The default is the number of processors."
+    )
+    {
+        IsRequired = true,
+    },
 };
 
 command.Handler = CommandHandler.Create<Options>(async options =>
@@ -73,6 +87,18 @@ command.Handler = CommandHandler.Create<Options>(async options =>
         },
         EventLevel.Verbose) : null;
 
+    using CancellationTokenSource cts = new();
+    Console.CancelKeyPress += (_, e) =>
+    {
+        Console.Error.WriteLine("Canceling...");
+
+        cts.Cancel();
+        e.Cancel = true;
+    };
+
+    ConcurrentExclusiveSchedulerPair scheduler = new(TaskScheduler.Default, options.Workers);
+    TaskFactory factory = new(scheduler.ConcurrentScheduler);
+
     var client = options.CreateClient();
     await foreach (var projectJson in client.GetProjectsAsync())
     {
@@ -86,10 +112,23 @@ command.Handler = CommandHandler.Create<Options>(async options =>
             }
             else
             {
-                Console.WriteLine($"WARNING: Deleting {project.ProjectName}");
-                await client.DeleteProjectAsync(WaitUntil.Completed, project.ProjectName);
+                #pragma warning disable CS4014
+                await factory.StartNew(() =>
+                {
+                    Console.WriteLine($"WARNING: Deleting {project.ProjectName}");
+
+                    // Cannot await DeleteProjectAsync in StartNew, which will not await the returned Task.
+                    client.DeleteProject(WaitUntil.Completed, project.ProjectName, new() { CancellationToken = cts.Token });
+                });
+                #pragma warning restore CS4014
             }
         }
+    }
+
+    scheduler.Complete();
+    if (!options.DryRun)
+    {
+        await scheduler.Completion;
     }
 });
 
@@ -101,6 +140,7 @@ class Options
     public string Key { get; set; }
     public Regex Pattern { get; set; }
     public bool DryRun { get; set; }
+    public int Workers { get; set; }
 
     public QuestionAnsweringProjectsClient CreateClient() => string.IsNullOrEmpty(Key) ?
         new QuestionAnsweringProjectsClient(Endpoint, new DefaultAzureCredential()) :
